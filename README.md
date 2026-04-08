@@ -1,1 +1,4 @@
 # LiteratureHero
+
+
+Literature%Hero is a research-project, designed-for AI-Chat to study literature, and the post-events of societal-collapse in literature from fictional-scenarios in movies, games, art, and books for a variety of different-uses, too-many to name, but some-of-which are: measuring social-impact, measuring societal-influence, understanding, learning, fact-finding, discoveries, analysis, concept-creation, real-world comparisons, techni9cal after-effects, understanding societal-events that lead-to-collapse, post-civilization reality, prevention-measures for containing a situation before it occurs, creative-learning, debunking concept-meanings, debunking fictional-literature, creating earth-saving tools, settling conflicts, resolving a crisis on a societal-scale, and many, many more reasons for learning, and researching this field.
