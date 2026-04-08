@@ -1,451 +1,487 @@
 -- src/gesp_threshold_sweep.lua
--- Threshold sweep and calibration tool for the GESP claim-type classifier.
+-- GESP Threshold Sweep and Safety-Weighted Calibration Harness
 --
--- Responsibilities
---   - Iterate over a grid of rule thresholds θ for claim-type and dD bands.
---   - Run the classifier on the gold corpus via the validation harness adapter.
---   - Compute per-type F1, macro/micro F1, and confusion matrices.
---   - Track cost-sensitive loss using the existing metrics module.
---   - Use disagreement notes and key confusions (Moral Panic vs Everything-Is-Broken)
---     to run targeted sweeps and log which θ values fix those errors.
---   - Evaluate robustness across domains (fiction, news, social).
---   - Emit a JSON/CSV summary of the best θ* and per-domain metrics.
+-- USR: 0x9D (high research usefulness, safety-first, hex-tagged)
+-- GESP tag: 0xACDF  (Geo/Eco/Social/Political coverage, collapse dynamics)
 --
--- Invariants
---   - No thresholds hard-coded in classifier logic: all exposed here via config.
---   - Dimension-level metrics and doom/agency metrics computed first; claim-type
---     metrics evaluated on top of these primitives.
---   - Cost-sensitive loss prioritizes high S/P stress and doom-saturated discourse.
-
-local json = require("dkjson")        -- Expect dkjson or similar in repo.
-local Metrics = require("toolsevalmetricsandloss")  -- cost/F1/MAE utilities.
-local ClaimClassifier = require("src.claimclassifier")
-local Debias = require("src.gespdebiasanalyzer")
-local Harness = require("src.gespvalidationharness") -- for loading corpus, adapters.
-
-local ThresholdSweep = {}
+-- ROLE
+--   This module wraps the existing src/gesp_validation_harness.lua and
+--   tools/eval/metrics_and_loss.lua to run a structured sweep over
+--   stress / dD / claim-type thresholds and cost weights.
+--
+--   It:
+--     - Delegates all per-record analysis to the existing analyzers
+--       (src/gesp_discourse_analyzer.lua, src/gesp_debias_analyzer.lua,
+--        src/claim_classifier.lua, src/doom_agency_decoder.lua).
+--     - Uses the validation harness as a pure evaluation oracle.
+--     - Sweeps threshold grids and cost-weight λ ranges.
+--     - Enforces safety-first optimization (high-cost FN on S/P & doom).
+--     - Emits JSON + CSV + Markdown artifacts for audit-ready calibration.
+--
+--   It is intentionally a *thin orchestration layer*; no thresholds are
+--   hard-coded elsewhere. All bands / cutpoints live in this sweep and
+--   in small config tables, keeping the repo’s contracts stable.
+--
+--   Typical invocation:
+--     lua src/gesp_threshold_sweep.lua
+--
+-- COMPATIBILITY
+--   - Must stay compatible with:
+--       src/gesp_validation_harness.lua
+--       tools/eval/metrics_and_loss.lua
+--       data/corpus_gold_v1.lua
+--   - Does not change any of their contracts; only calls them.
 
 ----------------------------------------------------------------------
--- 0. Utility helpers
+-- 0. Requires and wiring
 ----------------------------------------------------------------------
 
-local function deepcopy(tbl)
-  if type(tbl) ~= "table" then return tbl end
-  local res = {}
-  for k, v in pairs(tbl) do
-    res[k] = deepcopy(v)
-  end
-  return res
+local ok_json, cjson = pcall(require, "cjson")
+local json = ok_json and cjson or nil
+
+-- Existing gold corpus + harness + metrics stack.
+local GoldCorpus = require("data.corpus_gold_v1")              -- .records
+local ValidationHarness = require("src.gesp_validation_harness") -- run(config) -> metrics, logs
+local MetricsAndLoss = require("tools.eval.metrics_and_loss")    -- cost-sensitive logic, registry
+
+----------------------------------------------------------------------
+-- 1. Global configuration for sweep
+----------------------------------------------------------------------
+
+local OUTPUT_DIR  = "output"
+local REPORT_DIR  = "reports"
+local SWEEP_ID    = os.date("gesp_threshold_sweep_%Y%m%d_%H%M%S")
+
+-- Hex-tagged metadata for USR and G/E/S/P coverage.
+local META = {
+  gesp_hex = "0xACDF",
+  usr_hex  = "0x9D",
+  role     = "Threshold calibration + safety-weight sweep for GESP + dD stack"
+}
+
+-- Default grids, chosen to be small but expandable.
+local CONFIG = {
+  -- Threshold grids (used by the harness via injected config)
+  t_dom_grid     = { 0.55, 0.65, 0.75 },  -- dominant-dimension stress
+  t_all_grid     = { 0.40, 0.50, 0.60 },  -- “everything high” stress
+  t_doom_grid    = { 0.70, 0.80, 0.90 },  -- doom-saturation for d/dD
+
+  -- Band quantiles for dD (low/high); same across G/E/S/P by invariant.
+  dD_quantiles   = {
+    { q_low = 0.25, q_high = 0.75 },
+    { q_low = 0.20, q_high = 0.80 },
+    { q_low = 0.30, q_high = 0.70 }
+  },
+
+  -- λ sweep (safety vs macro-F1). Safety-first invariant: λ_cost » λ_macro.
+  lambda_cost_grid  = { 1.0, 1.5 },
+  lambda_macro_grid = { 0.1, 0.2 },
+
+  -- Domain degradation flags (relative).
+  max_delta_F1_domain = 0.10,  -- >0.10 drop in macro-F1 flags degradation
+  max_rel_cost_domain = 0.20,  -- >0.20 relative cost increase flags degradation
+}
+
+----------------------------------------------------------------------
+-- 2. Simple utilities
+----------------------------------------------------------------------
+
+local function ensure_dir(path)
+  os.execute(string.format("mkdir -p %s", path))
 end
 
 local function safediv(num, den)
-  if not den or den == 0 then return 0 end
+  den = den or 0
+  if den == 0 then return 0 end
   return num / den
 end
 
-local function mkdir_p(path)
-  -- Minimal portable mkdir; treat as no-op if already exists.
-  os.execute(string.format("mkdir -p %q", path))
+local function get_domain(rec)
+  local src = (rec.context_source or rec.context_domain or "other"):lower()
+  if src:find("fiction") then return "fiction" end
+  if src:find("news")    then return "news"    end
+  if src:find("social")  then return "social"  end
+  return "other"
 end
 
 ----------------------------------------------------------------------
--- 1. Threshold configuration space
+-- 3. Harness adapter: inject θ (thresholds, bands, λ) into validation
+----------------------------------------------------------------------
+
+-- By design, src/gesp_validation_harness.lua exposes a single run(config)
+-- entrypoint that:
+--   - Reads the gold corpus (or accepts it via config.records).
+--   - Calls analyzers.
+--   - Returns a metrics table + optional logs.
 --
--- θ vector encodes:
---   - t_dom: dominant-dimension cutoff for Single-Factor Doom.
---   - t_all: all-dimensions-high cutoff for Everything-Is-Broken.
---   - t_doom: doom-saturation cutoff for Single-Factor Doom / doom-heavy logic.
---   - dD_bands: low/high for agency-leaning vs doom-leaning.
---
--- These are passed into ClaimClassifier via configuration and into Debias
--- for dD banding, so that tuning is centralised here.
-----------------------------------------------------------------------
+-- We treat it here as a black box with one extension point:
+--   config.thresholds, config.dD_bands, config.cost_weights
+-- The harness should already be wired to consume these if present.
 
-local function default_theta_grid()
-  return {
-    t_dom = {0.4, 0.5, 0.6},
-    t_all = {0.6, 0.7, 0.8},
-    t_doom = {0.5, 0.6, 0.7},
-    dD_low = {0.30, 0.35, 0.40},
-    dD_high = {0.60, 0.65, 0.70},
-  }
-end
+local function build_harness_config(theta, base_overrides)
+  base_overrides = base_overrides or {}
 
-local function cartesian_product(grid)
-  local keys = {"t_dom", "t_all", "t_doom", "dD_low", "dD_high"}
-  local combos = {}
-
-  local function recurse(i, current)
-    if i > #keys then
-      table.insert(combos, deepcopy(current))
-      return
-    end
-    local k = keys[i]
-    for _, v in ipairs(grid[k]) do
-      current[k] = v
-      recurse(i + 1, current)
-    end
-  end
-
-  recurse(1, {})
-  return combos
-end
-
-local function theta_id(theta)
-  return string.format("tdom=%.2f_tall=%.2f_tdoom=%.2f_dlow=%.2f_dhigh=%.2f",
-    theta.t_dom, theta.t_all, theta.t_doom, theta.dD_low, theta.dD_high)
-end
-
-----------------------------------------------------------------------
--- 2. Wiring thresholds into classifier and dD bands
-----------------------------------------------------------------------
-
-local function configure_stack_with_theta(theta)
-  -- Configure dD bands on the debias analyzer.
-  Debias.dDbands = {
-    low = theta.dD_low,
-    high = theta.dD_high,
+  local cfg = {
+    sweep_id   = SWEEP_ID,
+    theta      = theta,
+    meta       = META,
+    thresholds = {
+      t_dom  = theta.t_dom,
+      t_all  = theta.t_all,
+      t_doom = theta.t_doom
+    },
+    dD_bands = {
+      q_low  = theta.q_low,
+      q_high = theta.q_high
+    },
+    cost_weights = {
+      lambda_cost  = theta.lambda_cost,
+      lambda_macro = theta.lambda_macro
+    },
+    records = GoldCorpus.records or {}
   }
 
-  -- Configure claim-type thresholds on the classifier.
-  ClaimClassifier.thresholds = {
-    t_dom = theta.t_dom,
-    t_all = theta.t_all,
-    t_doom = theta.t_doom,
-    dD_low = theta.dD_low,
-    dD_high = theta.dD_high,
-  }
+  -- Allow the caller to override/extend any fields.
+  for k, v in pairs(base_overrides) do
+    cfg[k] = v
+  end
+
+  return cfg
 end
 
 ----------------------------------------------------------------------
--- 3. Gold corpus loading and domain splits
+-- 4. Objective J: safety-weighted cost + macro-F1
 ----------------------------------------------------------------------
 
-local function load_gold(path)
-  -- Delegate to harness loader if available; otherwise simple CSV/JSONL loader.
-  -- Expect records to include:
-  --   id, text, contextsource, claimtype (gold), isgold, disagreementnotes.
-  return Harness.load_gold_corpus(path)
-end
-
-local function split_by_domain(records)
-  local splits = {all = {}, fiction = {}, news = {}, social = {}}
-  for _, rec in ipairs(records) do
-    table.insert(splits.all, rec)
-    local src = (rec.contextsource or rec.context or "other"):lower()
-    if src == "fiction" then
-      table.insert(splits.fiction, rec)
-    elseif src == "news" then
-      table.insert(splits.news, rec)
-    elseif src == "social" or src == "forum" then
-      table.insert(splits.social, rec)
-    end
-  end
-  return splits
-end
-
-local function select_disagreement_subset(records)
-  local subset = {}
-  for _, rec in ipairs(records) do
-    if rec.isgold and rec.disagreementnotes and rec.disagreementnotes ~= "" then
-      table.insert(subset, rec)
-    end
-  end
-  return subset
-end
-
-local function select_moralpanic_vs_eib(records)
-  local subset = {}
-  for _, rec in ipairs(records) do
-    local ctype = rec.claimtype
-    if ctype == "Moral Panic" or ctype == "Everything-Is-Broken" then
-      table.insert(subset, rec)
-    end
-  end
-  return subset
-end
-
-----------------------------------------------------------------------
--- 4. Running classifier with current θ
+-- We assume ValidationHarness.run(config) returns a metrics table with:
+--   metrics.cost.L_cost                      (scalar)
+--   metrics.claimtype.macro_f1               (scalar)
+--   metrics.domain[dom].L_cost, .macro_f1    (per-domain)
+--   metrics.confusion.claimtype_matrix       (for MP vs EIB tracking)
+--   metrics.disagreement.*                   (for annotator A/B vs neither)
 --
--- Adapter:
---   - Use Debias.analyzetext for sclaimed, dD, etc.
---   - Call ClaimClassifier.classifyclaim for claim-type prediction.
---   - Build arrays gold/sys for Metrics functions.
-----------------------------------------------------------------------
+-- If these fields are missing, we fall back gracefully and keep
+-- the harness contracts intact.
 
-local function run_classifier_on_records(records)
-  local gold = {}
-  local sys = {}
+local function extract_scalar_metrics(metrics)
+  local L_cost  = 0
+  local macroF1 = 0
 
-  for _, rec in ipairs(records) do
-    local text = rec.text or ""
-    local context = rec.context or rec
-    local debias_out = Debias.analyzetext(text, context, {})
-    local cls = ClaimClassifier.classifyclaim(text, {
-      saopts = { },                     -- passthrough analyzer options if needed
-      daopts = { },                     -- doom/agency options
-      sestimated = debias_out.stressestimated,
-    })
-
-    table.insert(gold, {
-      id = rec.id,
-      claimtype = rec.claimtype,
-      sclaimed = rec.sclaimed,
-      Dgold = rec.delta,
-      dDgold = rec.dDoverall,
-      dDdimgold = rec.dDperdim,
-      contextsource = rec.contextsource,
-    })
-
-    table.insert(sys, {
-      id = rec.id,
-      claimtypepred = cls.claimtype,
-      spred = cls.raw and cls.raw.stressclaimed or debias_out.stressclaimed,
-      Dpred = cls.raw and cls.raw.distortion or debias_out.delta,
-      dDpred = cls.raw and cls.raw.doverall or debias_out.dDoverall,
-      dDdimpred = cls.raw and cls.raw.dperdim or debias_out.dDperdim,
-      contextsource = rec.contextsource,
-    })
+  if metrics.cost and metrics.cost.L_cost then
+    L_cost = metrics.cost.L_cost
+  elseif MetricsAndLoss and MetricsAndLoss.global_cost_from_metrics then
+    L_cost = MetricsAndLoss.global_cost_from_metrics(metrics)
   end
 
-  return gold, sys
+  if metrics.claimtype and metrics.claimtype.macro_f1 then
+    macroF1 = metrics.claimtype.macro_f1
+  elseif MetricsAndLoss and MetricsAndLoss.global_macroF1_from_metrics then
+    macroF1 = MetricsAndLoss.global_macroF1_from_metrics(metrics)
+  end
+
+  return L_cost, macroF1
+end
+
+local function compute_J(L_cost, macroF1, theta)
+  return - theta.lambda_cost * L_cost + theta.lambda_macro * macroF1
 end
 
 ----------------------------------------------------------------------
--- 5. Metrics for a given θ on a given subset
+-- 5. Single θ run: call harness, collect global/domain/error metrics
 ----------------------------------------------------------------------
 
-local function evaluate_theta_on_subset(theta, records, cost_weights)
-  configure_stack_with_theta(theta)
-  local gold, sys = run_classifier_on_records(records)
+local function run_single_theta(theta)
+  local harness_cfg = build_harness_config(theta)
+  local metrics, logs = ValidationHarness.run(harness_cfg)
 
-  -- Dimension stress/dD metrics.
-  local mae = Metrics.computemae(gold, sys)
-  local hs = Metrics.computehighstressmetrics(gold, sys, {tau = 0.5})
-  local macroF1, pertype = Metrics.computeclaimtypemacrof1(gold, sys)
-  local loss = Metrics.computecostloss(gold, sys, cost_weights or {})
+  local L_cost, macroF1 = extract_scalar_metrics(metrics)
+  local J = compute_J(L_cost, macroF1, theta)
+
+  -- Domain-specific metrics.
+  local domain_metrics = {}
+  if metrics.domain then
+    for dom, dm in pairs(metrics.domain) do
+      domain_metrics[dom] = {
+        L_cost  = dm.L_cost or 0,
+        macro_f1 = dm.macro_f1 or 0
+      }
+    end
+  end
+
+  -- Moral Panic vs Everything-Is-Broken confusion counts.
+  local mp_to_eib, eib_to_mp = 0, 0
+  if metrics.confusion and metrics.confusion.claimtype_matrix then
+    local cm = metrics.confusion.claimtype_matrix
+    local MP = "Moral Panic"
+    local EIB = "Everything-Is-Broken"
+    if cm[MP] and cm[MP][EIB] then mp_to_eib = cm[MP][EIB] end
+    if cm[EIB] and cm[EIB][MP] then eib_to_mp = cm[EIB][MP] end
+  end
+
+  -- Annotator disagreement metrics: alignment with A vs B vs neither.
+  local disagree_macroF1, align_A, align_B, align_neither = 0, 0, 0, 0
+  if metrics.disagreement then
+    disagree_macroF1 = metrics.disagreement.macro_f1 or 0
+    align_A          = metrics.disagreement.align_A or 0
+    align_B          = metrics.disagreement.align_B or 0
+    align_neither    = metrics.disagreement.align_neither or 0
+  end
 
   return {
-    theta = deepcopy(theta),
-    macroF1 = macroF1,
-    pertype = pertype,
-    mae = mae,
-    highstress = hs,
-    cost = loss.total_cost,
-    cost_breakdown = loss.breakdown,
-    gold_size = #gold,
-  }, gold, sys
+    theta            = theta,
+    metrics          = metrics,
+    logs             = logs,
+    L_cost           = L_cost,
+    macroF1          = macroF1,
+    J                = J,
+    domain_metrics   = domain_metrics,
+    mp_to_eib        = mp_to_eib,
+    eib_to_mp        = eib_to_mp,
+    disagree_macroF1 = disagree_macroF1,
+    disagree_align   = {
+      A       = align_A,
+      B       = align_B,
+      neither = align_neither
+    }
+  }
 end
 
 ----------------------------------------------------------------------
--- 6. Confusion matrices for claim types
+-- 6. Sweep over θ grid
 ----------------------------------------------------------------------
 
-local function confusion_matrix_claimtype(gold, sys)
-  local labels = {}
-  for i = 1, #gold do
-    labels[gold[i].claimtype] = true
-    labels[sys[i].claimtypepred] = true
-  end
-  local types = {}
-  for t, _ in pairs(labels) do table.insert(types, t) end
+local function run_sweep()
+  ensure_dir(OUTPUT_DIR)
+  ensure_dir(REPORT_DIR)
 
-  local mat = {}
-  for _, gt in ipairs(types) do
-    mat[gt] = {}
-    for _, pt in ipairs(types) do
-      mat[gt][pt] = 0
+  local records = GoldCorpus.records or {}
+  if #records == 0 then
+    print("[gesp_threshold_sweep] No gold records; aborting.")
+    return
+  end
+
+  print(string.format("[gesp_threshold_sweep] Loaded %d gold records.", #records))
+
+  local results = {}
+
+  for _, t_dom in ipairs(CONFIG.t_dom_grid) do
+    for _, t_all in ipairs(CONFIG.t_all_grid) do
+      for _, t_doom in ipairs(CONFIG.t_doom_grid) do
+        for _, q_pair in ipairs(CONFIG.dD_quantiles) do
+          for _, lambda_cost in ipairs(CONFIG.lambda_cost_grid) do
+            for _, lambda_macro in ipairs(CONFIG.lambda_macro_grid) do
+              local theta = {
+                t_dom        = t_dom,
+                t_all        = t_all,
+                t_doom       = t_doom,
+                q_low        = q_pair.q_low,
+                q_high       = q_pair.q_high,
+                lambda_cost  = lambda_cost,
+                lambda_macro = lambda_macro
+              }
+
+              local res = run_single_theta(theta)
+              results[#results+1] = res
+
+              print(string.format(
+                "[θ] t_dom=%.2f t_all=%.2f t_doom=%.2f q=(%.2f,%.2f) λ_c=%.2f λ_F1=%.2f | F1=%.3f L=%.1f J=%.3f",
+                t_dom, t_all, t_doom,
+                q_pair.q_low, q_pair.q_high,
+                lambda_cost, lambda_macro,
+                res.macroF1, res.L_cost, res.J
+              ))
+            end
+          end
+        end
+      end
     end
   end
 
-  for i = 1, #gold do
-    local gt = gold[i].claimtype
-    local pt = sys[i].claimtypepred
-    if not mat[gt] then mat[gt] = {} end
-    if not mat[gt][pt] then mat[gt][pt] = 0 end
-    mat[gt][pt] = mat[gt][pt] + 1
+  if #results == 0 then
+    print("[gesp_threshold_sweep] No results produced; aborting.")
+    return
   end
 
-  return {types = types, matrix = mat}
-end
+  -- Select best J under safety-first objective.
+  local best_idx, best_J = nil, nil
+  for i, r in ipairs(results) do
+    if not best_J or r.J > best_J then
+      best_J  = r.J
+      best_idx = i
+    end
+  end
+  local best = results[best_idx]
 
-----------------------------------------------------------------------
--- 7. Targeted sweeps for disagreement / Moral Panic vs Everything-Is-Broken
---
--- For selected subsets, we track how many gold mislabels are resolved
--- under each θ, especially confusion between Moral Panic and Everything-Is-Broken.
-----------------------------------------------------------------------
+  print("[gesp_threshold_sweep] Selected global best θ*:")
+  print(string.format(
+    "  t_dom=%.2f t_all=%.2f t_doom=%.2f q=(%.2f,%.2f) λ_c=%.2f λ_F1=%.2f | F1=%.3f L=%.1f J=%.3f",
+    best.theta.t_dom, best.theta.t_all, best.theta.t_doom,
+    best.theta.q_low, best.theta.q_high,
+    best.theta.lambda_cost, best.theta.lambda_macro,
+    best.macroF1, best.L_cost, best.J
+  ))
 
-local function targeted_error_analysis(theta, records)
-  configure_stack_with_theta(theta)
-  local gold, sys = run_classifier_on_records(records)
+  --------------------------------------------------------------------
+  -- 7. Domain degradation analysis
+  --------------------------------------------------------------------
 
-  local fixed_moralpanic_eib = 0
-  local total_moralpanic_eib = 0
-  local fixed_any_disagreement = 0
-  local total_any_disagreement = #records
+  local global_F1   = best.macroF1
+  local global_cost = best.L_cost
 
-  for i = 1, #gold do
-    local g = gold[i]
-    local s = sys[i]
-    local gt = g.claimtype
-    local pt = s.claimtypepred
+  local domain_flags = {}
+  for dom, dm in pairs(best.domain_metrics or {}) do
+    local dF1 = global_F1 - (dm.macro_f1 or 0)
+    local rel_cost = 0
+    if dm.L_cost and global_cost > 0 then
+      rel_cost = (dm.L_cost - global_cost) / global_cost
+    end
 
-    if gt == "Moral Panic" or gt == "Everything-Is-Broken" then
-      total_moralpanic_eib = total_moralpanic_eib + 1
-      if pt == gt then
-        fixed_moralpanic_eib = fixed_moralpanic_eib + 1
+    domain_flags[dom] = {
+      delta_macroF1      = dF1,
+      rel_cost_increase  = rel_cost,
+      flag_F1            = dF1 > CONFIG.max_delta_F1_domain,
+      flag_cost          = rel_cost > CONFIG.max_rel_cost_domain
+    }
+  end
+
+  --------------------------------------------------------------------
+  -- 8. JSON config export for θ*
+  --------------------------------------------------------------------
+
+  if json then
+    local json_path = string.format("%s/%s_best.json", OUTPUT_DIR, SWEEP_ID)
+    local payload = {
+      sweep_id   = SWEEP_ID,
+      meta       = META,
+      theta      = best.theta,
+      metrics    = {
+        macroF1          = best.macroF1,
+        L_cost           = best.L_cost,
+        J                = best.J,
+        mp_to_eib        = best.mp_to_eib,
+        eib_to_mp        = best.eib_to_mp,
+        disagree_macroF1 = best.disagree_macroF1,
+        disagree_align   = best.disagree_align
+      },
+      domains    = domain_flags
+    }
+
+    local fh = io.open(json_path, "w")
+    if fh then
+      fh:write(json.encode(payload))
+      fh:close()
+      print("[gesp_threshold_sweep] Wrote best config JSON: " .. json_path)
+    end
+  end
+
+  --------------------------------------------------------------------
+  -- 9. CSV grid export
+  --------------------------------------------------------------------
+
+  local csv_path = string.format("%s/%s_grid.csv", OUTPUT_DIR, SWEEP_ID)
+  local fh_csv = io.open(csv_path, "w")
+  if fh_csv then
+    fh_csv:write("t_dom,t_all,t_doom,q_low,q_high,lambda_cost,lambda_macro,macroF1,L_cost,J,mp_to_eib,eib_to_mp,disagree_macroF1\n")
+    for _, r in ipairs(results) do
+      fh_csv:write(string.format(
+        "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.4f,%.2f,%.4f,%d,%d,%.4f\n",
+        r.theta.t_dom, r.theta.t_all, r.theta.t_doom,
+        r.theta.q_low, r.theta.q_high,
+        r.theta.lambda_cost, r.theta.lambda_macro,
+        r.macroF1, r.L_cost, r.J,
+        r.mp_to_eib or 0, r.eib_to_mp or 0,
+        r.disagree_macroF1 or 0
+      ))
+    end
+    fh_csv:close()
+    print("[gesp_threshold_sweep] Wrote grid CSV: " .. csv_path)
+  end
+
+  --------------------------------------------------------------------
+  -- 10. Markdown summary for GitHub
+  --------------------------------------------------------------------
+
+  local md_path = string.format("%s/%s_summary.md", REPORT_DIR, SWEEP_ID)
+  local fh_md = io.open(md_path, "w")
+  if fh_md then
+    fh_md:write("# GESP Threshold + Cost Sweep Summary\n\n")
+    fh_md:write(string.format("- Sweep ID: `%s`\n", SWEEP_ID))
+    fh_md:write(string.format("- GESP hex tag: `%s`\n", META.gesp_hex))
+    fh_md:write(string.format("- USR (usefulness) tag: `%s`\n\n", META.usr_hex))
+
+    fh_md:write("## Best Global Configuration\n\n")
+    fh_md:write(string.format(
+      "- `t_dom` (dominant-dimension stress): **%.2f**\n" ..
+      "- `t_all` (everything-is-high threshold): **%.2f**\n" ..
+      "- `t_doom` (doom-saturation d/dD): **%.2f**\n" ..
+      "- dD quantiles: `q_low=%.2f`, `q_high=%.2f`\n" ..
+      "- `lambda_cost`: **%.2f** (safety weight)\n" ..
+      "- `lambda_macro`: **%.2f** (macro-F1 weight)\n\n",
+      best.theta.t_dom, best.theta.t_all, best.theta.t_doom,
+      best.theta.q_low, best.theta.q_high,
+      best.theta.lambda_cost, best.theta.lambda_macro
+    ))
+
+    fh_md:write(string.format(
+      "- Global macro-F1 (claim types): **%.3f**\n" ..
+      "- Global safety-weighted loss `L_cost`: **%.1f**\n" ..
+      "- Combined objective `J = -λ_cost·L_cost + λ_macro·F1_macro`: **%.3f**\n\n",
+      best.macroF1, best.L_cost, best.J
+    ))
+
+    fh_md:write("### Moral Panic vs Everything-Is-Broken\n\n")
+    fh_md:write(string.format(
+      "- Moral Panic → Everything-Is-Broken confusions: **%d**\n" ..
+      "- Everything-Is-Broken → Moral Panic confusions: **%d**\n\n",
+      best.mp_to_eib or 0, best.eib_to_mp or 0
+    ))
+
+    fh_md:write("### Annotator Disagreement Slice\n\n")
+    fh_md:write(string.format(
+      "- Disagreement macro-F1: **%.3f**\n" ..
+      "- Align with annotator A: **%d**\n" ..
+      "- Align with annotator B: **%d**\n" ..
+      "- Align with neither: **%d**\n\n",
+      best.disagree_macroF1 or 0,
+      best.disagree_align.A or 0,
+      best.disagree_align.B or 0,
+      best.disagree_align.neither or 0
+    ))
+
+    fh_md:write("## Domain Robustness and Degradation Flags\n\n")
+    for _, dom in ipairs({ "fiction", "news", "social", "other" }) do
+      local dm   = best.domain_metrics[dom] or {}
+      local flag = domain_flags[dom] or {}
+
+      fh_md:write(string.format("### %s\n\n", dom:gsub("^%l", string.upper)))
+      fh_md:write(string.format(
+        "- Domain macro-F1: **%.3f**\n" ..
+        "- Δ macro-F1 vs global: **%.3f**\n" ..
+        "- Relative cost increase vs global: **%.3f**\n",
+        dm.macro_f1 or 0,
+        flag.delta_macroF1 or 0,
+        flag.rel_cost_increase or 0
+      ))
+
+      if flag.flag_F1 or flag.flag_cost then
+        fh_md:write("- **Degradation flagged**: consider domain-specific tuning thresholds.\n\n")
+      else
+        fh_md:write("- No severe degradation under current configuration.\n\n")
       end
     end
 
-    if pt == gt then
-      fixed_any_disagreement = fixed_any_disagreement + 1
-    end
-  end
+    fh_md:write("## Notes and Next Steps\n\n")
+    fh_md:write("- This sweep treats safety-critical cost (high S/P stress FN and doom-saturated mislabels) as the primary optimization target.\n")
+    fh_md:write("- Thresholds selected here can be written back into the shared config and used by src/gesp_validation_harness.lua as defaults.\n")
+    fh_md:write("- The CSV grid can be used to visualize trade-offs between macro-F1, cost, and Moral Panic vs Everything-Is-Broken confusions.\n")
 
-  return {
-    theta = deepcopy(theta),
-    fixed_moralpanic_eib = fixed_moralpanic_eib,
-    total_moralpanic_eib = total_moralpanic_eib,
-    moralpanic_eib_fix_rate = safediv(fixed_moralpanic_eib, total_moralpanic_eib),
-    fixed_any_disagreement = fixed_any_disagreement,
-    total_any_disagreement = total_any_disagreement,
-    disagreement_fix_rate = safediv(fixed_any_disagreement, total_any_disagreement),
-  }
+    fh_md:close()
+    print("[gesp_threshold_sweep] Wrote Markdown summary: " .. md_path)
+  end
 end
 
 ----------------------------------------------------------------------
--- 8. Domain-specific robustness evaluation
+-- 11. Entry point
 ----------------------------------------------------------------------
 
-local function evaluate_theta_across_domains(theta, splits, cost_weights)
-  local domain_results = {}
-  for name, recs in pairs(splits) do
-    if #recs > 0 then
-      local res = evaluate_theta_on_subset(theta, recs, cost_weights)
-      domain_results[name] = res
-    end
-  end
-  return domain_results
-end
-
-----------------------------------------------------------------------
--- 9. Global sweep procedure
-----------------------------------------------------------------------
-
-function ThresholdSweep.run(args)
-  args = args or {}
-  local gold_path = args.gold_path or "data/corpus_gold.jsonl"
-  local out_dir = args.out_dir or "output/threshold_sweep"
-  local grid = args.grid or default_theta_grid()
-
-  mkdir_p(out_dir)
-
-  local all_records = load_gold(gold_path)
-  local splits = split_by_domain(all_records)
-  local disagreements = select_disagreement_subset(all_records)
-  local mp_vs_eib = select_moralpanic_vs_eib(all_records)
-
-  local cost_weights = args.cost_weights or {
-    fn_high_S = 5.0,
-    fn_high_P = 5.0,
-    miss_doom_heavy = 4.0,
-    fp_low = 1.0,
-  }
-
-  local combos = cartesian_product(grid)
-  local best = nil
-  local best_id = nil
-
-  local sweep_summary = {}
-  local targeted_summary = {}
-
-  for idx, theta in ipairs(combos) do
-    local theta_name = theta_id(theta)
-
-    -- Global evaluation on all gold records.
-    local res_all = evaluate_theta_on_subset(theta, splits.all, cost_weights)
-    local dom_res = evaluate_theta_across_domains(theta, splits, cost_weights)
-    local conf = confusion_matrix_claimtype(select(2, run_classifier_on_records(splits.all)))
-
-    -- Targeted analysis on disagreement and Moral Panic vs EIB.
-    local targ_dis = nil
-    if #disagreements > 0 then
-      targ_dis = targeted_error_analysis(theta, disagreements)
-    end
-    local targ_mp_eib = nil
-    if #mp_vs_eib > 0 then
-      targ_mp_eib = targeted_error_analysis(theta, mp_vs_eib)
-    end
-
-    sweep_summary[theta_name] = {
-      theta = theta,
-      all = res_all,
-      domains = dom_res,
-      confusion = conf,
-    }
-    targeted_summary[theta_name] = {
-      disagreements = targ_dis,
-      moralpanic_vs_eib = targ_mp_eib,
-    }
-
-    -- Selection rule: prefer lower cost; break ties with higher macro-F1.
-    local score_cost = res_all[1].cost
-    local score_f1 = res_all[1].macroF1
-    if not best or score_cost < best.cost or
-      (math.abs(score_cost - best.cost) < 1e-6 and score_f1 > best.macroF1) then
-      best = {
-        theta = deepcopy(theta),
-        cost = score_cost,
-        macroF1 = score_f1,
-        domains = dom_res,
-      }
-      best_id = theta_name
-    end
-  end
-
-  -- Write summaries.
-  local best_path = out_dir .. "/best_theta.json"
-  local sweep_path = out_dir .. "/threshold_sweep_summary.json"
-  local targ_path = out_dir .. "/threshold_targeted_summary.json"
-
-  do
-    local fh = assert(io.open(best_path, "w"))
-    fh:write(json.encode({
-      best_theta = best.theta,
-      selector = "min_cost_then_max_macroF1",
-      best_id = best_id,
-      global_cost = best.cost,
-      global_macroF1 = best.macroF1,
-      domains = best.domains,
-    }, {indent = true}))
-    fh:close()
-  end
-
-  do
-    local fh = assert(io.open(sweep_path, "w"))
-    fh:write(json.encode(sweep_summary, {indent = false}))
-    fh:close()
-  end
-
-  do
-    local fh = assert(io.open(targ_path, "w"))
-    fh:write(json.encode(targeted_summary, {indent = false}))
-    fh:close()
-  end
-
-  return best
-end
-
-----------------------------------------------------------------------
--- 10. CLI entrypoint
---
--- Example:
---   lua -e 'require("src.gesp_threshold_sweep").run{
---            gold_path="data/corpus_gold.jsonl",
---            out_dir="output/threshold_sweep"
---          }'
-----------------------------------------------------------------------
-
-return ThresholdSweep
+run_sweep()
