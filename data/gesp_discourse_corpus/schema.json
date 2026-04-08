@@ -1,0 +1,110 @@
+{
+  "version": "0.1.0",
+  "description": "Schema for the GESP discourse corpus used by LiteratureHero. Each row in the CSV files references a text fragment with GESP stress estimates, doom/agency annotations, and metadata.",
+  "fields": [
+    {
+      "name": "id",
+      "type": "string",
+      "description": "Stable unique identifier for the text fragment (e.g., LH-FIC-000001)."
+    },
+    {
+      "name": "source_type",
+      "type": "string",
+      "allowed_values": ["fiction", "news", "social", "historical_doc", "other"],
+      "description": "High-level source class."
+    },
+    {
+      "name": "source_name",
+      "type": "string",
+      "description": "Human-readable source (e.g., novel title, outlet name, platform)."
+    },
+    {
+      "name": "source_location",
+      "type": "string",
+      "description": "Location within the source (chapter/page for books, URL or article ID for news, post ID for social)."
+    },
+    {
+      "name": "language",
+      "type": "string",
+      "description": "ISO language code for the text (e.g., en, fr, es)."
+    },
+    {
+      "name": "text",
+      "type": "string",
+      "description": "Raw text fragment (paragraph, scene, news lede, post body)."
+    },
+    {
+      "name": "sG",
+      "type": "number",
+      "range": [0.0, 1.0],
+      "description": "Geo/Environmental stress score."
+    },
+    {
+      "name": "sE",
+      "type": "number",
+      "range": [0.0, 1.0],
+      "description": "Economic stress score."
+    },
+    {
+      "name": "sS",
+      "type": "number",
+      "range": [0.0, 1.0],
+      "description": "Social stress score."
+    },
+    {
+      "name": "sP",
+      "type": "number",
+      "range": [0.0, 1.0],
+      "description": "Political stress score."
+    },
+    {
+      "name": "hex_tag",
+      "type": "string",
+      "pattern": "^0x[0-9A-Fa-f]{4}$",
+      "description": "Hex encoding of GESP stress (0xGESP, each nibble 0–F)."
+    },
+    {
+      "name": "doom_agency_label",
+      "type": "string",
+      "allowed_values": ["doom_dominant", "balanced", "agency_dominant"],
+      "description": "Coarse discourse-stress label for doom vs agency."
+    },
+    {
+      "name": "doom_score",
+      "type": "number",
+      "range": [0.0, 1.0],
+      "description": "Optional scalar score for doom intensity."
+    },
+    {
+      "name": "agency_score",
+      "type": "number",
+      "range": [0.0, 1.0],
+      "description": "Optional scalar score for perceived agency."
+    },
+    {
+      "name": "case_family",
+      "type": "string",
+      "description": "Optional archetype label (e.g., rapid_shock_high_R, elite_implosion, climate_cascade, external_conquest, slow_hollowing, total_collapse)."
+    },
+    {
+      "name": "annotator_id",
+      "type": "string",
+      "description": "Identifier of human annotator or model version that produced the labels."
+    },
+    {
+      "name": "annotation_method",
+      "type": "string",
+      "description": "Description or code of the annotation protocol (e.g., human_v1, lua_auto_v1, hybrid_v2)."
+    },
+    {
+      "name": "created_at",
+      "type": "string",
+      "description": "Timestamp of annotation in ISO 8601 format."
+    },
+    {
+      "name": "notes",
+      "type": "string",
+      "description": "Free-form notes about ambiguity, disagreements, or special context."
+    }
+  ]
+}
