@@ -1,0 +1,7 @@
+"Family ID","Name","G Pattern","E Pattern","S Pattern","P Pattern","Typical R","Example Hex Peak","G/E/S/P Tag"
+"1","Rapid Shock with High Resilience","Mild spike, recovers","Sharp spike, fast decline","Moderate spike, recovers","Moderate spike, recovers","High (0.7–1)","0x7A66","0x8F79"
+"2","Elite Overproduction & Political Implosion","Stable G, indirect effects","Gradual rise, crisis spike","Rising polarization, crisis spike","Non-linear rise to high stress","Medium","0x79FF","0x4CDF"
+"3","Climate–Resource Cascade","Steady rise, high peak","Follows G with lag","Rising due to migration/conflict","Moderate then high under cascade","Variable","0xC9AA","0xFCB9"
+"4","External Conquest & Colonial Imposition","G intact, access controlled","Reoriented toward extraction","Heavy disruption, partial resilience","Internal P replaced or captured","Mixed (int/ext)","0x79DF","0x8BEF"
+"5","Long Slow Hollowing","Stable, minor drift","Slow worsening","Rising mistrust and polarization","Gradual institutional decay","Decreasing","0x577A","0x38BE"
+"6","Total Systemic Collapse","Near-max stress","Near-max stress","Near-max stress","Near-max stress","Very low","0xFFFF","0xFFFF"
